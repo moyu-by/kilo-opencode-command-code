@@ -131,7 +131,7 @@ const writeState = (name, value) => {
 /* ------------------------------------------------------------------ */
 
 // 与 package.json 的 version 保持同步（测试会断言两者一致）。
-const PLUGIN_VERSION = "1.2.2";
+const PLUGIN_VERSION = "1.2.3";
 const PLUGIN_NAME = "kilo-opencode-command-code";
 // 更新检查节流：24 小时内最多查一次 npm；同一版本只提示一次。
 const UPDATE_CHECK_TTL_MS = 24 * 60 * 60 * 1000;
