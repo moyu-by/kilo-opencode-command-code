@@ -74,12 +74,19 @@ process.env.CMD_API_KEY = "test-env-key";
 
 const { CommandCode } = await import("../index.js");
 const {
+  PLUGIN_NAME,
+  PLUGIN_VERSION,
   authFileCandidates,
   authRoots,
+  canWrite,
   detectClient,
+  fetchLatestVersion,
   firstWritableDir,
+  isNewer,
   resolveStoredApiKey,
   stateDirCandidates,
+  updateNoticeBody,
+  writeJson,
 } = CommandCode._internal;
 
 // 去掉可能存在的真实缓存（插件目录与临时回退目录），保证测试走 stub，结果确定。
@@ -293,4 +300,90 @@ test("firstWritableDir falls back to the temp dir when the plugin dir is read-on
     fs.rmSync(readOnly, { recursive: true, force: true });
     fs.rmSync(fallback, { recursive: true, force: true });
   }
+});
+
+test("firstWritableDir probes real writes (fs.access(W_OK) ignores ACLs on Windows)", () => {
+  // Windows 上 fs.accessSync(dir, W_OK) 只查只读属性、不查 ACL，会把无写权限目录
+  // 误判为可写。这里用“父路径是文件”的候选目录，任何平台任何权限下都必然不可写，
+  // 且不依赖 chmod/ACL，Windows 上同样能跑。
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "cmdcode-probe-"));
+  const file = path.join(base, "not-a-dir");
+  fs.writeFileSync(file, "x");
+  const blocked = path.join(file, "child");
+  const fallback = path.join(base, "fallback");
+  try {
+    assert.equal(canWrite(base), true);
+    assert.equal(canWrite(blocked), false);
+    assert.equal(firstWritableDir([blocked, fallback]), fallback);
+    // 可写目录仍然优先，且探测不留垃圾文件
+    assert.equal(firstWritableDir([base, fallback]), base);
+    assert.deepEqual(
+      fs.readdirSync(base).filter((name) => name.startsWith(".state-probe-")),
+      []
+    );
+  } finally {
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("writeJson replaces an existing state file and leaves no temp files", () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "cmdcode-write-"));
+  const file = path.join(base, ".cache.json");
+  try {
+    assert.equal(writeJson(file, { version: 1 }), true);
+    assert.equal(writeJson(file, { version: 2 }), true);
+    assert.deepEqual(JSON.parse(fs.readFileSync(file, "utf8")), {
+      version: 2,
+    });
+    assert.deepEqual(
+      fs.readdirSync(base).filter((name) => name.endsWith(".tmp")),
+      []
+    );
+  } finally {
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("isNewer compares versions, ignoring v prefix and prerelease suffixes", () => {
+  assert.equal(isNewer("1.2.3", "1.2.2"), true);
+  assert.equal(isNewer("v1.3.0", "1.2.9"), true);
+  assert.equal(isNewer("2.0.0", "1.99.99"), true);
+  assert.equal(isNewer("1.2.2", "1.2.2"), false);
+  assert.equal(isNewer("1.2.1", "1.2.2"), false);
+  assert.equal(isNewer("1.2.3-beta.1", "1.2.2"), true);
+  assert.equal(isNewer("1.2", "1.2.0"), false);
+});
+
+test("fetchLatestVersion reads the npm registry payload and surfaces HTTP errors", async () => {
+  const calls = [];
+  const stub = async (url) => {
+    calls.push(String(url));
+    return new Response(JSON.stringify({ version: "9.9.9" }), { status: 200 });
+  };
+  assert.equal(
+    await fetchLatestVersion(stub, "https://example.test/latest"),
+    "9.9.9"
+  );
+  assert.equal(calls[0], "https://example.test/latest");
+
+  const failing = async () => new Response("nope", { status: 500 });
+  await assert.rejects(
+    () => fetchLatestVersion(failing, "https://example.test/latest"),
+    /HTTP 500/
+  );
+});
+
+test("updateNoticeBody carries both versions for the toast", () => {
+  const body = updateNoticeBody("9.9.9");
+  assert.match(body.message, /9\.9\.9/);
+  assert.match(body.message, new RegExp(PLUGIN_VERSION.replace(/\./g, "\\.")));
+  assert.equal(body.variant, "info");
+});
+
+test("package.json stays in sync with the embedded plugin version", () => {
+  const pkg = JSON.parse(
+    fs.readFileSync(path.join(pluginDir, "package.json"), "utf8")
+  );
+  assert.equal(pkg.name, PLUGIN_NAME);
+  assert.equal(pkg.version, PLUGIN_VERSION);
 });

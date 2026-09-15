@@ -34,7 +34,7 @@ opencode plugin kilo-opencode-command-code -g   # OpenCode
 ```bash
 git clone https://github.com/moyu-by/kilo-opencode-command-code.git
 cd kilo-opencode-command-code
-bash install.sh          # Windows: powershell -ExecutionPolicy Bypass -File .\install.ps1
+bash install.sh          # Windows: 双击 install.cmd（或 powershell -ExecutionPolicy Bypass -File .\install.ps1）
 ```
 
 ### 2. 登录
@@ -93,6 +93,7 @@ set CMD_API_KEY=sk-xxxx && opencode
   - 非推理模型不生成思考档位变体
   - 缓存于 `.capabilities.json`，7 天有效期；失败时用旧缓存，仍无则退回关键词兜底
 - **Claude 自动路由**：Claude 走 Anthropic Messages 端点，其余走 OpenAI Chat Completions
+- **更新提示**：启动后异步检查 npm 上的最新版本，有新版本时在 TUI 弹 toast（24 小时内最多查一次、同一版本只提示一次；离线或宿主不支持 toast 时静默跳过，绝不阻断启动）
 - **零配置即用**：装好 + 登录一次即可；环境变量可免登录
 - **可手动覆盖**：按需覆盖单个模型的模态/参数，无需改插件
 
@@ -103,6 +104,7 @@ set CMD_API_KEY=sk-xxxx && opencode
 | `CMD_API_KEY` | 直接提供 API key（优先级最高） |
 | `COMMANDCODE_API_KEY` / `COMMAND_CODE_API_KEY` / `CMDCODE_API_KEY` | 同上，别名 |
 | `CMD_MODELS_DOCS_URL` | 覆盖能力表来源（默认官方模型表页） |
+| `CMD_UPDATE_CHECK_URL` | 覆盖更新检查来源（默认 npm registry 的 `.../latest`） |
 
 优先级：环境变量 > 凭据库中登录保存的 key。两者都没有时，客户端会照常提示登录。
 
@@ -138,12 +140,33 @@ kilo auth login -p cmdcode
 opencode auth login
 ```
 
+## 升级插件
+
+插件启动后会检查 npm 上的最新版本，有新版本会弹 toast 提示（如果宿主支持 toast）。客户端本身按 lock 缓存 npm 插件，不会自动升级，手动升级方式：
+
+- 方式 A（npm 插件）：删除 `~/.cache/opencode/packages/kilo-opencode-command-code*`（Windows：`%USERPROFILE%\.cache\opencode\packages\kilo-opencode-command-code*`）后重启客户端；或在配置里固定版本，例如 `"plugin": ["kilo-opencode-command-code@1.2.2"]`，重启后生效。
+- 方式 B / C（克隆 + 脚本）：重新执行安装命令或 `install.cmd` / `install.sh`，重启客户端。
+
+## 冒烟清单
+
+CI 覆盖单测（Windows + Linux），真实客户端请按安装方式在 4 种组合上各过一遍：
+
+| 步骤 | win + Kilo | win + OpenCode | lin + Kilo | lin + OpenCode |
+|---|---|---|---|---|
+| 安装（`install.cmd` / `install.sh` 或 npm 插件） | ☐ | ☐ | ☐ | ☐ |
+| 登录（`kilo auth login -p cmdcode` / `opencode auth login`） | ☐ | ☐ | ☐ | ☐ |
+| `/models` 出现 Command Code 与模型列表 | ☐ | ☐ | ☐ | ☐ |
+| 纯文本模型发一条消息并收到回复 | ☐ | ☐ | ☐ | ☐ |
+| 视觉模型上传一张图片并正常解析 | ☐ | ☐ | ☐ | ☐ |
+| 思考档位变体（`low/medium/high` 或 `thinking-on/off`）可切换 | ☐ | ☐ | ☐ | ☐ |
+
 ## 文件结构
 
 ```
 index.js            插件主文件（Kilo 与 OpenCode 共用，只导出函数）
 install.sh          Linux/macOS/Git-Bash 安装脚本（同步到 OpenCode）
 install.ps1         Windows PowerShell 安装脚本
+install.cmd         Windows 双击包装（自动 -ExecutionPolicy Bypass 调用 install.ps1）
 test/               node:test 测试
 .github/workflows/  CI 与发布流程
 .cache.json         模型列表缓存（运行时自动生成，已 gitignore）
@@ -153,8 +176,8 @@ test/               node:test 测试
 ## 说明
 
 - 插件零第三方依赖、纯 ESM；`import.meta.dirname` 不可用时自动回退 `fileURLToPath`，跨平台安全。
-- `index.js` 只允许导出函数、且不能拆成同目录的第二个 `.js`：宿主会遍历模块的所有导出（OpenCode 遇到非函数导出会直接抛 `TypeError` 并静默丢弃整个插件），并会把 `{plugin,plugins}/*.{ts,js}` 里的每个文件都当成插件加载。内部纯函数挂在 `CommandCode._internal` 上仅供测试。
-- 缓存文件优先生成在插件文件同目录；该目录只读时回退到用户级临时目录（`os.tmpdir()` 下的 `kilo-opencode-command-code-<uid>`）。读写始终用同一个目录，避免读到旧缓存。
+- `index.js` 只允许导出函数、且不能拆成同目录的第二个 `.js`：宿主会遍历模块的所有导出（OpenCode 遇到非函数导出会直接抛 `TypeError` 并静默丢弃整个插件），并会把 `{plugin,plugins}/*.{ts,js}` 里的每个文件都当成插件加载。内部函数挂在 `CommandCode._internal` 上仅供测试。
+- 缓存文件优先生成在插件文件同目录；该目录不可写时回退到用户级临时目录（`os.tmpdir()` 下的 `kilo-opencode-command-code-<uid>`，Windows 为 `%TEMP%`）。可写性用“实际写探测”判断（Windows 上 `fs.access(W_OK)` 不检查 ACL，会把 `C:\Program Files` 之类误判为可写），读写始终用同一个目录，避免读到旧缓存。缓存写入用“临时文件 + rename”，Windows 下目标被占用时会重试并最终退化为直接覆盖，不会静默丢缓存。
 - 行为与原生接入点的唯一差异：连接后需要重启客户端一次模型才会出现（见上文提示）。凭据优先读当前客户端自己的凭据库，读不到才回退另一个客户端（见上文提示）。
 
 ## License

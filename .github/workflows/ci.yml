@@ -11,10 +11,11 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest, windows-latest]
         node: ["20", "22"]
     steps:
       - uses: actions/checkout@v5
@@ -26,3 +27,22 @@ jobs:
         run: node --check index.js
       - name: Run tests
         run: node --test
+
+  bun:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: oven-sh/setup-bun@v2
+      - name: Load plugin under Bun
+        run: |
+          cat > /tmp/plugin-load-check.mjs <<'EOF'
+          const mod = await import(process.cwd() + "/index.js");
+          if (typeof mod.CommandCode !== "function") {
+            throw new Error("CommandCode export is not a function");
+          }
+          if (typeof mod.default !== "function") {
+            throw new Error("default export is not a function");
+          }
+          console.log("bun: plugin loaded, exports are callable");
+          EOF
+          bun /tmp/plugin-load-check.mjs

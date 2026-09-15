@@ -5,21 +5,28 @@
 # 被 PowerShell 重写破坏的问题。
 #
 # 用法（在插件目录下）：
-#   powershell -ExecutionPolicy Bypass -File .\install.ps1
-# 或右键“使用 PowerShell 运行”。
+#   双击 install.cmd（推荐：自动绕过执行策略限制）
+#   或 powershell -ExecutionPolicy Bypass -File .\install.ps1
+#   （执行策略为 Restricted 时直接 .\install.ps1 会被拒绝，这是 Windows 默认行为）
 
 $ErrorActionPreference = "Stop"
 
 $PluginDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $IndexFile = Join-Path $PluginDir "index.js"
-$HomeDir   = $env:USERPROFILE
+
+# 当前用户主目录：优先 .NET API，避免 $env:USERPROFILE 缺失或被污染的边缘情况。
+$HomeDir = [Environment]::GetFolderPath("UserProfile")
+if (-not $HomeDir) { $HomeDir = $env:USERPROFILE }
+
+# 配置根目录：与插件 authRoots 保持一致，支持 XDG_CONFIG_HOME。
+$ConfigHome = if ($env:XDG_CONFIG_HOME) { $env:XDG_CONFIG_HOME } else { Join-Path $HomeDir ".config" }
 
 if (-not (Test-Path -LiteralPath $IndexFile)) {
   throw "index.js not found: $IndexFile"
 }
 
 # Kilo 全局 plugins 目录
-$KiloPlugins = Join-Path $HomeDir ".config\kilo\plugins"
+$KiloPlugins = Join-Path $ConfigHome "kilo\plugins"
 New-Item -ItemType Directory -Force -Path $KiloPlugins | Out-Null
 # 清理历史遗留的旧版 cmdcode 插件文件，避免重复注册（只删已知的旧文件名）
 $LegacyPluginNames = @("cmdcode.js", "cmdcode-models.js", "cmdcode-auth.js")
@@ -30,7 +37,7 @@ Copy-Item -LiteralPath $IndexFile -Destination (Join-Path $KiloPlugins "command-
 Write-Host "Installed to Kilo: $KiloPlugins\command-code.js"
 
 # OpenCode 全局 plugins 目录
-$OcPlugins = Join-Path $HomeDir ".config\opencode\plugins"
+$OcPlugins = Join-Path $ConfigHome "opencode\plugins"
 New-Item -ItemType Directory -Force -Path $OcPlugins | Out-Null
 Copy-Item -LiteralPath $IndexFile -Destination (Join-Path $OcPlugins "command-code.js") -Force
 Write-Host "Installed to OpenCode: $OcPlugins\command-code.js"
@@ -38,10 +45,10 @@ Write-Host "Installed to OpenCode: $OcPlugins\command-code.js"
 # 提示：plugins 目录里的文件与配置文件 "plugin" 数组里的条目会被分别加载，
 # 同一个插件命中两处就会重复注册，二选一即可。
 $configs = @(
-  (Join-Path $HomeDir ".config\kilo\kilo.jsonc"),
-  (Join-Path $HomeDir ".config\kilo\kilo.json"),
-  (Join-Path $HomeDir ".config\opencode\opencode.json"),
-  (Join-Path $HomeDir ".config\opencode\opencode.jsonc")
+  (Join-Path $ConfigHome "kilo\kilo.jsonc"),
+  (Join-Path $ConfigHome "kilo\kilo.json"),
+  (Join-Path $ConfigHome "opencode\opencode.json"),
+  (Join-Path $ConfigHome "opencode\opencode.jsonc")
 )
 foreach ($cfg in $configs) {
   if (-not (Test-Path -LiteralPath $cfg)) { continue }

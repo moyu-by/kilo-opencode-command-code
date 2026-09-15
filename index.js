@@ -9,6 +9,8 @@ const MODELS_DOCS_URL = "https://commandcode.ai/docs/reference/cli/models";
 const FETCH_TIMEOUT_MS = 8000;
 // 能力元数据变化很慢，缓存 7 天；同时每次启动若过期才联网刷新。
 const CAP_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+// Windows 上目标文件被占用时 rename 会偶发失败，重试次数（退避 15/30/60/120ms）。
+const RENAME_RETRIES = 4;
 
 /**
  * 插件目录：Windows / Linux / macOS 通用。
@@ -32,6 +34,25 @@ function stateDirCandidates(pluginDir, uid = currentUid(), tmpDir = os.tmpdir())
 }
 
 /**
+ * 目录可写性探测：Windows 上 fs.accessSync(W_OK) 只检查只读属性、不检查 ACL，
+ * 会把 C:\Program Files 之类的目录误判为可写；所以这里实际写一个探测文件再删除。
+ * 失败方向是安全的：误判为不可写只会回退到用户级临时目录（同样可写且读写同目录）。
+ */
+function canWrite(dir) {
+  const probe = path.join(dir, `.state-probe-${process.pid}-${Date.now()}`);
+  try {
+    fs.writeFileSync(probe, "");
+    fs.rmSync(probe, { force: true });
+    return true;
+  } catch {
+    try {
+      fs.rmSync(probe, { force: true });
+    } catch {}
+    return false;
+  }
+}
+
+/**
  * 状态文件目录：优先插件目录；只读（如全局/只读安装位置）时回退到用户级临时目录。
  * 读与写必须落在同一个目录，否则会出现“新数据写进临时目录、却一直读到插件目录里
  * 的旧文件”的错位，缓存永远刷不新。
@@ -40,9 +61,8 @@ function firstWritableDir(candidates) {
   for (const dir of candidates) {
     try {
       fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-      fs.accessSync(dir, fs.constants.W_OK);
-      return dir;
     } catch {}
+    if (canWrite(dir)) return dir;
   }
   return candidates[0];
 }
@@ -59,12 +79,35 @@ const readJson = (file) => {
   }
 };
 
-// 原子写：先写临时文件再 rename，避免并发下产生半截 JSON。
+// 同步微休眠：Node/Bun 主线程都可用；运行时不允许时被 try/catch 吞掉，退化为紧凑重试。
+const sleepSync = (ms) => {
+  try {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  } catch {}
+};
+
+/**
+ * 原子写：先写临时文件再 rename，避免并发下产生半截 JSON。
+ * Windows 上目标文件被杀软/其它进程短暂占用时 rename 会抛 EPERM/EACCES，
+ * 所以重试几次；仍失败就直接覆盖写，保证缓存不会静默丢失。
+ */
 const writeJson = (file, value) => {
   const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
+  const payload = JSON.stringify(value);
   try {
-    fs.writeFileSync(tmp, JSON.stringify(value));
-    fs.renameSync(tmp, file);
+    fs.writeFileSync(tmp, payload);
+    for (let attempt = 0; attempt < RENAME_RETRIES; attempt++) {
+      try {
+        fs.renameSync(tmp, file);
+        return true;
+      } catch {
+        sleepSync(15 * 2 ** attempt);
+      }
+    }
+    fs.writeFileSync(file, payload);
+    try {
+      fs.rmSync(tmp, { force: true });
+    } catch {}
     return true;
   } catch {
     try {
@@ -82,6 +125,113 @@ const writeState = (name, value) => {
   } catch {}
   writeJson(path.join(STATE_DIR, name), value);
 };
+
+/* ------------------------------------------------------------------ */
+/* 版本更新提示                                                        */
+/* ------------------------------------------------------------------ */
+
+// 与 package.json 的 version 保持同步（测试会断言两者一致）。
+const PLUGIN_VERSION = "1.2.2";
+const PLUGIN_NAME = "kilo-opencode-command-code";
+// 更新检查节流：24 小时内最多查一次 npm；同一版本只提示一次。
+const UPDATE_CHECK_TTL_MS = 24 * 60 * 60 * 1000;
+// 启动后稍等再弹，给 TUI 时间完成挂载。
+const UPDATE_NOTICE_DELAY_MS = 2500;
+
+const latestVersionUrl = () =>
+  process.env.CMD_UPDATE_CHECK_URL ||
+  `https://registry.npmjs.org/${PLUGIN_NAME}/latest`;
+
+/** 只比较 major.minor.patch（忽略 v 前缀与 prerelease）；解析不出的段按 0 处理。 */
+function isNewer(latest, current) {
+  const parse = (v) =>
+    String(v ?? "")
+      .trim()
+      .replace(/^v/i, "")
+      .split("-")[0]
+      .split(".")
+      .map((n) => {
+        const value = Number.parseInt(n, 10);
+        return Number.isFinite(value) ? value : 0;
+      });
+  const a = parse(latest);
+  const b = parse(current);
+  for (let i = 0; i < Math.max(a.length, b.length, 3); i++) {
+    const x = a[i] ?? 0;
+    const y = b[i] ?? 0;
+    if (x !== y) return x > y;
+  }
+  return false;
+}
+
+async function fetchLatestVersion(fetchImpl = fetch, url = latestVersionUrl()) {
+  const res = await fetchImpl(url, {
+    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const data = await res.json();
+  return typeof data?.version === "string" ? data.version : null;
+}
+
+/** toast 内容：短、含版本号与下一步动作。 */
+function updateNoticeBody(latest) {
+  return {
+    title: "Command Code 插件有更新",
+    message: `v${PLUGIN_VERSION} → v${latest}，更新插件并重启客户端后生效。`,
+    variant: "info",
+    duration: 10000,
+  };
+}
+
+/**
+ * 调宿主 SDK 弹 toast；只有真正展示成功才返回 true（TUI 未就绪/请求失败返回 false，
+ * 这样下次启动还会再提示）。无 client 或旧宿主没有 tui.showToast 时静默跳过。
+ */
+async function showToast(client, body) {
+  try {
+    if (typeof client?.tui?.showToast !== "function") return false;
+    const result = await client.tui.showToast({ body });
+    const data = result?.data ?? result;
+    return data !== false;
+  } catch {
+    return false;
+  }
+}
+
+/** 检查 npm 最新版本，有新版本且未提示过时弹 toast；任何失败都静默忽略。 */
+async function notifyPluginUpdate(client) {
+  try {
+    const cached = readState(".update.json") ?? {};
+    let latest = cached.latest;
+    let fetchedAt = cached.fetchedAt ?? 0;
+    if (Date.now() - fetchedAt >= UPDATE_CHECK_TTL_MS) {
+      try {
+        const fresh = await fetchLatestVersion();
+        if (fresh) {
+          latest = fresh;
+          fetchedAt = Date.now();
+        }
+      } catch {}
+    }
+    if (!latest || !isNewer(latest, PLUGIN_VERSION)) return;
+    if (cached.notifiedVersion === latest) return;
+    const shown = await showToast(client, updateNoticeBody(latest));
+    writeState(".update.json", {
+      fetchedAt,
+      latest,
+      notifiedVersion: shown ? latest : cached.notifiedVersion,
+    });
+  } catch {}
+}
+
+/** 启动时调度一次更新提示；timer unref，避免拖住测试等短命进程退出。 */
+function scheduleUpdateNotice(client) {
+  const timer = setTimeout(
+    () => void notifyPluginUpdate(client),
+    UPDATE_NOTICE_DELAY_MS
+  );
+  if (typeof timer?.unref === "function") timer.unref();
+}
 
 /* ------------------------------------------------------------------ */
 /* 能力推断（文档同步 → 代码强制 → 关键词兜底）                          */
@@ -422,61 +572,66 @@ async function loadAuthOptions(getAuth) {
 /* 插件入口（Kilo 与 OpenCode 使用同一份 Hooks 结构）                    */
 /* ------------------------------------------------------------------ */
 
-export const CommandCode = async () => ({
-  config: async (config) => {
-    const provider = (config.provider ??= {});
-    const cmdcode = (provider.cmdcode ??= {});
-    if (!cmdcode.npm) cmdcode.npm = "@ai-sdk/openai-compatible";
-    if (!cmdcode.name) cmdcode.name = "Command Code";
-    const opts = (cmdcode.options ??= {});
-    if (!opts.baseURL) opts.baseURL = BASE_URL;
+export const CommandCode = async (input = {}) => {
+  scheduleUpdateNotice(input?.client);
+  return {
+    config: async (config) => {
+      const provider = (config.provider ??= {});
+      const cmdcode = (provider.cmdcode ??= {});
+      if (!cmdcode.npm) cmdcode.npm = "@ai-sdk/openai-compatible";
+      if (!cmdcode.name) cmdcode.name = "Command Code";
+      const opts = (cmdcode.options ??= {});
+      if (!opts.baseURL) opts.baseURL = BASE_URL;
 
-    // 清理旧版遗留的静态 cmdcode-claude provider（若有）。
-    delete provider["cmdcode-claude"];
+      // 清理旧版遗留的静态 cmdcode-claude provider（若有）。
+      delete provider["cmdcode-claude"];
 
-    // 未连接（没有 API key）时不注册任何模型，/models 里就不会出现 cmdcode。
-    // provider 与 auth 入口仍保留，用户可通过 /connect 或 kilo auth login 连接。
-    const apiKey = resolveApiKey();
-    if (!apiKey) {
-      delete cmdcode.models;
-      return;
-    }
-    if (!opts.apiKey) opts.apiKey = apiKey;
+      // 未连接（没有 API key）时不注册任何模型，/models 里就不会出现 cmdcode。
+      // provider 与 auth 入口仍保留，用户可通过 /connect 或 kilo auth login 连接。
+      const apiKey = resolveApiKey();
+      if (!apiKey) {
+        delete cmdcode.models;
+        return;
+      }
+      if (!opts.apiKey) opts.apiKey = apiKey;
 
-    // 用户写在配置里的 provider.cmdcode.models 优先级更高：
-    // 同 id 的用户条目与自动推断结果做“条目内顶层键合并”，
-    // 因此无需改插件即可手工修正某个模型的模态/参数/变体等，
-    // 同时保留自动生成的 name / limit / variants。
-    const userModels = cmdcode.models ?? {};
-    const [items, capabilities] = await Promise.all([
-      loadModelList(),
-      loadCapabilities(),
-    ]);
-    const built = buildModels(items ?? [], buildCapIndex(capabilities));
-    const merged = { ...built };
-    for (const [id, entry] of Object.entries(userModels)) {
-      const base = merged[id];
-      merged[id] = base ? { ...base, ...entry } : entry;
-    }
-    if (items || Object.keys(userModels).length > 0) cmdcode.models = merged;
-  },
-  auth: {
-    provider: "cmdcode",
-    loader: loadAuthOptions,
-    methods: [{ type: "api", label: "Command Code" }],
-  },
-});
+      // 用户写在配置里的 provider.cmdcode.models 优先级更高：
+      // 同 id 的用户条目与自动推断结果做“条目内顶层键合并”，
+      // 因此无需改插件即可手工修正某个模型的模态/参数/变体等，
+      // 同时保留自动生成的 name / limit / variants。
+      const userModels = cmdcode.models ?? {};
+      const [items, capabilities] = await Promise.all([
+        loadModelList(),
+        loadCapabilities(),
+      ]);
+      const built = buildModels(items ?? [], buildCapIndex(capabilities));
+      const merged = { ...built };
+      for (const [id, entry] of Object.entries(userModels)) {
+        const base = merged[id];
+        merged[id] = base ? { ...base, ...entry } : entry;
+      }
+      if (items || Object.keys(userModels).length > 0) cmdcode.models = merged;
+    },
+    auth: {
+      provider: "cmdcode",
+      loader: loadAuthOptions,
+      methods: [{ type: "api", label: "Command Code" }],
+    },
+  };
+};
 
 export default CommandCode;
 
 /*
- * 仅供测试的内部纯函数，挂在函数对象上而**不作为模块导出**：宿主加载器会遍历
+ * 仅供测试的内部函数，挂在函数对象上而**不作为模块导出**：宿主加载器会遍历
  * 模块的所有导出，OpenCode 遇到非函数导出会直接抛
  * `TypeError("Plugin export is not a function")` 并静默丢弃整个插件（Kilo 只是跳过）。
  * 另外 `{plugin,plugins}/*.{ts,js}` 下的每个 js 文件都会被当成插件加载，
  * 所以内部代码也不能拆成同目录的第二个 .js 文件。
  */
 CommandCode._internal = {
+  PLUGIN_VERSION,
+  PLUGIN_NAME,
   detectClient,
   authRoots,
   authFileCandidates,
@@ -484,5 +639,10 @@ CommandCode._internal = {
   parseCapabilities,
   normId,
   stateDirCandidates,
+  canWrite,
   firstWritableDir,
+  writeJson,
+  isNewer,
+  fetchLatestVersion,
+  updateNoticeBody,
 };

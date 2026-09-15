@@ -1,6 +1,7 @@
 # 运行时生成的缓存（不需要提交）
 .cache.json
 .capabilities.json
+.update.json
 
 # 依赖与备份
 node_modules/
