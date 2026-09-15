@@ -74,7 +74,7 @@ set CMD_API_KEY=sk-xxxx && opencode
 > **提示：模型按连接状态显示**
 > - 未连接（没有 API key）时，`/models` 里不会出现任何 cmdcode 模型。
 > - 连接后**需重启客户端一次**，模型列表才会出现（插件的 `config` 钩子只在启动时运行；这一点与原生 provider 的即时刷新不同）。
-> - 启动时按此顺序找 key：环境变量 → 凭据库 `~/.local/share/kilo/auth.json` / `~/.local/share/opencode/auth.json`（Windows 上同样是 `%USERPROFILE%\.local\share\...`）。识别不出当前客户端时，会回退到另一个客户端的凭据库，避免“连了却不显示模型”。
+> - 启动时按此顺序找 key：环境变量 → 凭据库 `~/.local/share/kilo/auth.json` / `~/.local/share/opencode/auth.json`（Windows 上同样是 `%USERPROFILE%\.local\share\...`）。当前客户端没有凭据时会**回退使用另一个客户端的凭据**，避免“连了却不显示模型”；因此任一客户端登录过，两端都会显示模型，反之**在某一端退出登录不会让另一端断开**。
 
 ### 3. 使用
 
@@ -141,7 +141,7 @@ opencode auth login
 ## 文件结构
 
 ```
-index.js            插件主文件（Kilo 与 OpenCode 共用）
+index.js            插件主文件（Kilo 与 OpenCode 共用，只导出函数）
 install.sh          Linux/macOS/Git-Bash 安装脚本（同步到 OpenCode）
 install.ps1         Windows PowerShell 安装脚本
 test/               node:test 测试
@@ -153,8 +153,9 @@ test/               node:test 测试
 ## 说明
 
 - 插件零第三方依赖、纯 ESM；`import.meta.dirname` 不可用时自动回退 `fileURLToPath`，跨平台安全。
-- 缓存文件生成在插件文件同目录，因此该目录需要可写。
-- 行为与原生接入点的唯一差异：连接后需要重启客户端一次模型才会出现（见上文提示）。其余（未连接不显示、能力声明、Claude 路由、凭据按客户端隔离）均与原生一致。
+- `index.js` 只允许导出函数、且不能拆成同目录的第二个 `.js`：宿主会遍历模块的所有导出（OpenCode 遇到非函数导出会直接抛 `TypeError` 并静默丢弃整个插件），并会把 `{plugin,plugins}/*.{ts,js}` 里的每个文件都当成插件加载。内部纯函数挂在 `CommandCode._internal` 上仅供测试。
+- 缓存文件优先生成在插件文件同目录；该目录只读时回退到用户级临时目录（`os.tmpdir()` 下的 `kilo-opencode-command-code-<uid>`）。读写始终用同一个目录，避免读到旧缓存。
+- 行为与原生接入点的唯一差异：连接后需要重启客户端一次模型才会出现（见上文提示）。凭据优先读当前客户端自己的凭据库，读不到才回退另一个客户端（见上文提示）。
 
 ## License
 

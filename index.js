@@ -19,11 +19,35 @@ const PLUGIN_DIR =
     ? import.meta.dirname
     : path.dirname(fileURLToPath(import.meta.url));
 
-// 状态文件目录：优先插件目录；只读（如全局/只读安装位置）时回退到临时目录。
-const STATE_DIRS = [
-  PLUGIN_DIR,
-  path.join(os.tmpdir(), "kilo-opencode-command-code"),
-];
+/** 状态文件候选目录。临时目录带 uid 后缀并限制权限，避免共享 /tmp 下的可预测路径被抢占。 */
+const currentUid = () =>
+  typeof process.getuid === "function" ? process.getuid() : undefined;
+
+function stateDirCandidates(pluginDir, uid = currentUid(), tmpDir = os.tmpdir()) {
+  const name =
+    uid === undefined
+      ? "kilo-opencode-command-code"
+      : `kilo-opencode-command-code-${uid}`;
+  return [pluginDir, path.join(tmpDir, name)];
+}
+
+/**
+ * 状态文件目录：优先插件目录；只读（如全局/只读安装位置）时回退到用户级临时目录。
+ * 读与写必须落在同一个目录，否则会出现“新数据写进临时目录、却一直读到插件目录里
+ * 的旧文件”的错位，缓存永远刷不新。
+ */
+function firstWritableDir(candidates) {
+  for (const dir of candidates) {
+    try {
+      fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+      fs.accessSync(dir, fs.constants.W_OK);
+      return dir;
+    } catch {}
+  }
+  return candidates[0];
+}
+
+const STATE_DIR = firstWritableDir(stateDirCandidates(PLUGIN_DIR));
 
 const MODALITY_KEYS = ["text", "image", "audio", "video", "pdf"];
 
@@ -50,23 +74,13 @@ const writeJson = (file, value) => {
   }
 };
 
-// 按目录优先级读取状态文件（读第一个存在的）。
-const readState = (name) => {
-  for (const dir of STATE_DIRS) {
-    const data = readJson(path.join(dir, name));
-    if (data) return data;
-  }
-  return null;
-};
+const readState = (name) => readJson(path.join(STATE_DIR, name));
 
-// 按目录优先级写入状态文件（写第一个可写的）。
 const writeState = (name, value) => {
-  for (const dir of STATE_DIRS) {
-    try {
-      fs.mkdirSync(dir, { recursive: true });
-    } catch {}
-    if (writeJson(path.join(dir, name), value)) return;
-  }
+  try {
+    fs.mkdirSync(STATE_DIR, { recursive: true });
+  } catch {}
+  writeJson(path.join(STATE_DIR, name), value);
 };
 
 /* ------------------------------------------------------------------ */
@@ -300,19 +314,23 @@ function envApiKey() {
   return undefined;
 }
 
-/* 支持的两个客户端；顺序仅在无法识别时作为回退优先级。 */
+/* 支持的两个客户端；顺序仅在无法识别宿主时作为回退优先级。 */
 const CLIENTS = ["kilo", "opencode"];
 
 /**
  * 判断当前运行在哪个客户端：Kilo 还是 OpenCode。
- * 两者的登录凭据库是分开的，必须知道该读哪一个，否则会把另一个客户端的
- * 登录状态误当成已连接。只认进程可执行文件路径（对环境变量和参数都免疫：
- * 在 Kilo 里启动 OpenCode 会同时带上 KILO=1，argv 也可能含插件路径）。
+ * 两者的登录凭据库是分开的，优先读宿主自己的那一份。
+ * 只认进程可执行文件路径（对环境变量和参数都免疫：在 Kilo 里启动 OpenCode
+ * 会同时带上 KILO=1，argv 也可能含插件路径）。
  * 用 basename 而非整串匹配，避免用户名/安装目录含 "kilo"/"opencode" 时误判；
  * 先判 kilo，避免 @kilocode 路径被 "opencode" 抢先匹配。
+ * 分隔符同时认 `\` 和 `/`，这样在任何平台上分析 Windows 路径的结果都一致。
  */
 function detectClient(execPath = process.execPath) {
-  const base = path.basename(execPath || "").toLowerCase();
+  const base = String(execPath || "")
+    .split(/[\\/]/)
+    .pop()
+    .toLowerCase();
   if (base.includes("kilo")) return "kilo";
   if (base.includes("opencode")) return "opencode";
   return null;
@@ -343,18 +361,8 @@ function authFileCandidates(app, opts = {}) {
   );
 }
 
-/** 从指定客户端的凭据库里读 cmdcode 的 key；没有则返回 undefined。 */
-function readStoredKey(app) {
-  for (const file of authFileCandidates(app)) {
-    const entry = readJson(file)?.cmdcode;
-    const key = typeof entry === "string" ? entry : entry?.key;
-    if (key && key.trim()) return key.trim();
-  }
-  return undefined;
-}
-
 /**
- * 按优先级解析已存储的 key：优先当前客户端，读不到则回退另一个客户端。
+ * 按优先级解析已存储的 key：优先宿主客户端，读不到则回退另一个客户端。
  * 纯函数，便于测试。识别失败（preferred 为 null）时按 CLIENTS 顺序尝试。
  */
 function resolveStoredApiKey(preferred, readKey) {
@@ -368,7 +376,23 @@ function resolveStoredApiKey(preferred, readKey) {
   return undefined;
 }
 
-/** 当前是否已连接 Command Code（读凭据库）。 */
+/** 从指定客户端的凭据库里读 cmdcode 的 key；没有则返回 undefined。 */
+function readStoredKey(app) {
+  for (const file of authFileCandidates(app)) {
+    const entry = readJson(file)?.cmdcode;
+    const key = typeof entry === "string" ? entry : entry?.key;
+    if (key && key.trim()) return key.trim();
+  }
+  return undefined;
+}
+
+/**
+ * 当前是否已连接 Command Code（读凭据库）。
+ *
+ * 这是有意的跨客户端回退：同一个 Command Code 账号在 Kilo 与 OpenCode 里是同一个
+ * key，只在一端登录过时，另一端也不该表现为“没连接”。副作用：在某一端退出登录
+ * 不会让另一端断开；宿主识别不出来时按 CLIENTS 顺序（kilo 优先）尝试。
+ */
 function storedApiKey() {
   return resolveStoredApiKey(detectClient(), readStoredKey);
 }
@@ -445,12 +469,20 @@ export const CommandCode = async () => ({
 
 export default CommandCode;
 
-/* 仅供测试使用的内部纯函数，不属于对外 API。 */
-export const _internal = {
+/*
+ * 仅供测试的内部纯函数，挂在函数对象上而**不作为模块导出**：宿主加载器会遍历
+ * 模块的所有导出，OpenCode 遇到非函数导出会直接抛
+ * `TypeError("Plugin export is not a function")` 并静默丢弃整个插件（Kilo 只是跳过）。
+ * 另外 `{plugin,plugins}/*.{ts,js}` 下的每个 js 文件都会被当成插件加载，
+ * 所以内部代码也不能拆成同目录的第二个 .js 文件。
+ */
+CommandCode._internal = {
   detectClient,
   authRoots,
   authFileCandidates,
   resolveStoredApiKey,
   parseCapabilities,
   normId,
+  stateDirCandidates,
+  firstWritableDir,
 };
