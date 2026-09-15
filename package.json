@@ -1,6 +1,6 @@
 {
   "name": "kilo-opencode-command-code",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Command Code Provider API plugin for Kilo and OpenCode — auto-syncs models and capabilities (vision/reasoning), handles auth, routes Claude via the Anthropic Messages endpoint",
   "type": "module",
   "main": "index.js",

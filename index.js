@@ -19,8 +19,11 @@ const PLUGIN_DIR =
     ? import.meta.dirname
     : path.dirname(fileURLToPath(import.meta.url));
 
-const CACHE_FILE = path.join(PLUGIN_DIR, ".cache.json");
-const CAP_FILE = path.join(PLUGIN_DIR, ".capabilities.json");
+// 状态文件目录：优先插件目录；只读（如全局/只读安装位置）时回退到临时目录。
+const STATE_DIRS = [
+  PLUGIN_DIR,
+  path.join(os.tmpdir(), "kilo-opencode-command-code"),
+];
 
 const MODALITY_KEYS = ["text", "image", "audio", "video", "pdf"];
 
@@ -32,10 +35,38 @@ const readJson = (file) => {
   }
 };
 
+// 原子写：先写临时文件再 rename，避免并发下产生半截 JSON。
 const writeJson = (file, value) => {
+  const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
   try {
-    fs.writeFileSync(file, JSON.stringify(value));
-  } catch {}
+    fs.writeFileSync(tmp, JSON.stringify(value));
+    fs.renameSync(tmp, file);
+    return true;
+  } catch {
+    try {
+      fs.rmSync(tmp, { force: true });
+    } catch {}
+    return false;
+  }
+};
+
+// 按目录优先级读取状态文件（读第一个存在的）。
+const readState = (name) => {
+  for (const dir of STATE_DIRS) {
+    const data = readJson(path.join(dir, name));
+    if (data) return data;
+  }
+  return null;
+};
+
+// 按目录优先级写入状态文件（写第一个可写的）。
+const writeState = (name, value) => {
+  for (const dir of STATE_DIRS) {
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+    } catch {}
+    if (writeJson(path.join(dir, name), value)) return;
+  }
 };
 
 /* ------------------------------------------------------------------ */
@@ -93,7 +124,7 @@ function parseCapabilities(html) {
 
 /** 拉取并解析官方能力表；失败时回退到旧缓存，再不行返回 null（走关键词兜底）。 */
 async function loadCapabilities() {
-  const cached = readJson(CAP_FILE);
+  const cached = readState(".capabilities.json");
   if (
     cached?.capabilities &&
     Date.now() - (cached.fetchedAt ?? 0) < CAP_TTL_MS
@@ -108,7 +139,7 @@ async function loadCapabilities() {
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const capabilities = parseCapabilities(await res.text());
     if (Object.keys(capabilities).length > 0) {
-      writeJson(CAP_FILE, { fetchedAt: Date.now(), capabilities });
+      writeState(".capabilities.json", { fetchedAt: Date.now(), capabilities });
       return capabilities;
     }
     throw new Error("empty capability map");
@@ -186,12 +217,12 @@ async function loadModelList() {
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data = await res.json();
     if (Array.isArray(data?.data) && data.data.length > 0) {
-      writeJson(CACHE_FILE, data);
+      writeState(".cache.json", data);
       return data.data;
     }
     throw new Error("empty model list");
   } catch {
-    const cached = readJson(CACHE_FILE);
+    const cached = readState(".cache.json");
     if (Array.isArray(cached?.data) && cached.data.length > 0) return cached.data;
     return null;
   }
@@ -269,44 +300,77 @@ function envApiKey() {
   return undefined;
 }
 
+/* 支持的两个客户端；顺序仅在无法识别时作为回退优先级。 */
+const CLIENTS = ["kilo", "opencode"];
+
 /**
  * 判断当前运行在哪个客户端：Kilo 还是 OpenCode。
  * 两者的登录凭据库是分开的，必须知道该读哪一个，否则会把另一个客户端的
  * 登录状态误当成已连接。只认进程可执行文件路径（对环境变量和参数都免疫：
  * 在 Kilo 里启动 OpenCode 会同时带上 KILO=1，argv 也可能含插件路径）。
+ * 用 basename 而非整串匹配，避免用户名/安装目录含 "kilo"/"opencode" 时误判；
+ * 先判 kilo，避免 @kilocode 路径被 "opencode" 抢先匹配。
  */
-function detectClient() {
-  const probe = (process.execPath || "").toLowerCase();
-  if (probe.includes("opencode")) return "opencode";
-  if (probe.includes("kilo")) return "kilo";
+function detectClient(execPath = process.execPath) {
+  const base = path.basename(execPath || "").toLowerCase();
+  if (base.includes("kilo")) return "kilo";
+  if (base.includes("opencode")) return "opencode";
   return null;
 }
 
-/** 当前客户端可能的 auth.json 位置（跨平台）。 */
-function authFileCandidates(app) {
-  const home = os.homedir();
+/** 各平台可能存放客户端数据的根目录；官方真实位置 ~/.local/share 优先。 */
+function authRoots(
+  platform = process.platform,
+  home = os.homedir(),
+  env = process.env
+) {
   const roots = [];
-  if (process.env.XDG_DATA_HOME) roots.push(process.env.XDG_DATA_HOME);
-  if (process.platform === "win32") {
-    if (process.env.APPDATA) roots.push(process.env.APPDATA);
-    if (process.env.LOCALAPPDATA) roots.push(process.env.LOCALAPPDATA);
-  } else if (process.platform === "darwin") {
+  if (env.XDG_DATA_HOME) roots.push(env.XDG_DATA_HOME);
+  roots.push(path.join(home, ".local", "share"));
+  if (platform === "win32") {
+    if (env.LOCALAPPDATA) roots.push(env.LOCALAPPDATA);
+    if (env.APPDATA) roots.push(env.APPDATA);
+  } else if (platform === "darwin") {
     roots.push(path.join(home, "Library", "Application Support"));
   }
-  roots.push(path.join(home, ".local", "share"));
-  return roots.map((root) => path.join(root, app, "auth.json"));
+  return [...new Set(roots)];
 }
 
-/** 从当前客户端的凭据库里读 cmdcode 的 key；没有则返回 undefined。 */
-function storedApiKey() {
-  const client = detectClient();
-  if (!client) return undefined;
-  for (const file of authFileCandidates(client)) {
+/** 某客户端可能的 auth.json 位置（跨平台）。 */
+function authFileCandidates(app, opts = {}) {
+  return authRoots(opts.platform, opts.home, opts.env).map((root) =>
+    path.join(root, app, "auth.json")
+  );
+}
+
+/** 从指定客户端的凭据库里读 cmdcode 的 key；没有则返回 undefined。 */
+function readStoredKey(app) {
+  for (const file of authFileCandidates(app)) {
     const entry = readJson(file)?.cmdcode;
     const key = typeof entry === "string" ? entry : entry?.key;
     if (key && key.trim()) return key.trim();
   }
   return undefined;
+}
+
+/**
+ * 按优先级解析已存储的 key：优先当前客户端，读不到则回退另一个客户端。
+ * 纯函数，便于测试。识别失败（preferred 为 null）时按 CLIENTS 顺序尝试。
+ */
+function resolveStoredApiKey(preferred, readKey) {
+  const order = preferred
+    ? [preferred, ...CLIENTS.filter((c) => c !== preferred)]
+    : CLIENTS;
+  for (const app of order) {
+    const key = readKey(app);
+    if (key) return key;
+  }
+  return undefined;
+}
+
+/** 当前是否已连接 Command Code（读凭据库）。 */
+function storedApiKey() {
+  return resolveStoredApiKey(detectClient(), readStoredKey);
 }
 
 /** 当前是否已连接 Command Code：环境变量优先，其次凭据库。 */
@@ -380,3 +444,13 @@ export const CommandCode = async () => ({
 });
 
 export default CommandCode;
+
+/* 仅供测试使用的内部纯函数，不属于对外 API。 */
+export const _internal = {
+  detectClient,
+  authRoots,
+  authFileCandidates,
+  resolveStoredApiKey,
+  parseCapabilities,
+  normId,
+};

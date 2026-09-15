@@ -46,11 +46,27 @@ kilo auth login -p cmdcode      # Kilo
 opencode auth login             # OpenCode，选择 Command Code
 ```
 
-不想登录，就用环境变量直接给 key：
+不想登录，就用环境变量直接给 key。
+
+macOS / Linux / Git-Bash：
 
 ```bash
 CMD_API_KEY=sk-xxxx kilo
 CMD_API_KEY=sk-xxxx opencode
+```
+
+Windows PowerShell：
+
+```powershell
+$env:CMD_API_KEY = "sk-xxxx"; kilo
+$env:CMD_API_KEY = "sk-xxxx"; opencode
+```
+
+Windows cmd：
+
+```bat
+set CMD_API_KEY=sk-xxxx && kilo
+set CMD_API_KEY=sk-xxxx && opencode
 ```
 
 重启客户端生效。
@@ -58,6 +74,7 @@ CMD_API_KEY=sk-xxxx opencode
 > **提示：模型按连接状态显示**
 > - 未连接（没有 API key）时，`/models` 里不会出现任何 cmdcode 模型。
 > - 连接后**需重启客户端一次**，模型列表才会出现（插件的 `config` 钩子只在启动时运行；这一点与原生 provider 的即时刷新不同）。
+> - 启动时按此顺序找 key：环境变量 → 凭据库 `~/.local/share/kilo/auth.json` / `~/.local/share/opencode/auth.json`（Windows 上同样是 `%USERPROFILE%\.local\share\...`）。识别不出当前客户端时，会回退到另一个客户端的凭据库，避免“连了却不显示模型”。
 
 ### 3. 使用
 
